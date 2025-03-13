@@ -9,6 +9,8 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -96,4 +98,16 @@ func waitForDeletion(ctx context.Context, cl getter, objs ...client.Object) erro
 		}
 	}
 	return nil
+}
+
+func patchObject(ctx context.Context, cl client.Client, obj interface{}) error {
+	var (
+		u   unstructured.Unstructured
+		err error
+	)
+	u.Object, err = runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return err
+	}
+	return cl.Patch(ctx, &u, client.Apply)
 }
