@@ -2,24 +2,40 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
-
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-
-	olmv1 "github.com/operator-framework/operator-controller/api/v1"
+	"time"
 
 	"github.com/operator-framework/kubectl-operator/pkg/action"
+	ocv1 "github.com/operator-framework/operator-controller/api/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	applyconfigurationscorev1 "k8s.io/client-go/applyconfigurations/core/v1"
+	applyconfigurationsrbacv1 "k8s.io/client-go/applyconfigurations/rbac/v1"
 )
 
 type OperatorInstall struct {
-	config *action.Configuration
-
-	Package string
-
-	Logf func(string, ...interface{})
+	config                         *action.Configuration
+	Namespace                      NamespaceConfig
+	Package                        string
+	Channels                       []string
+	Version                        string
+	ServiceAccount                 string
+	CatalogSelector                metav1.LabelSelector
+	UnsafeCreateClusterRoleBinding bool
+	CleanupTimeout                 time.Duration
+	Logf                           func(string, ...interface{})
+}
+type NamespaceConfig struct {
+	Name        string
+	Labels      map[string]string
+	Annotations map[string]string
 }
 
 func NewOperatorInstall(cfg *action.Configuration) *OperatorInstall {
@@ -29,47 +45,145 @@ func NewOperatorInstall(cfg *action.Configuration) *OperatorInstall {
 	}
 }
 
-func (i *OperatorInstall) Run(ctx context.Context) (*olmv1.ClusterExtension, error) {
-	// TODO(developer): Lookup package information when the OLMv1 equivalent of the
-	//     packagemanifests API is available. That way, we can check to see if the
-	//     package is actually available to the cluster before creating the Operator
-	//     object.
+func (i *OperatorInstall) applyNamespace(ctx context.Context) error {
+	ac := applyconfigurationscorev1.Namespace(i.Namespace.Name)
+	if i.Namespace.Labels != nil {
+		ac = ac.WithLabels(i.Namespace.Labels)
+	}
+	if i.Namespace.Annotations != nil {
+		ac = ac.WithAnnotations(i.Namespace.Annotations)
+	}
+	return patchObject(ctx, i.config.Client, ac)
+}
 
-	opKey := types.NamespacedName{Name: i.Package}
-	op := &olmv1.ClusterExtension{
-		ObjectMeta: metav1.ObjectMeta{Name: opKey.Name},
-		Spec: olmv1.ClusterExtensionSpec{
-			Source: olmv1.SourceConfig{
-				SourceType: "Catalog",
-				Catalog: &olmv1.CatalogFilter{
-					PackageName: i.Package,
-				},
+func (i *OperatorInstall) applyServiceAccount(ctx context.Context) error {
+	ac := applyconfigurationscorev1.ServiceAccount(i.ServiceAccount, i.Namespace.Name)
+	return patchObject(ctx, i.config.Client, ac)
+}
+
+func (i *OperatorInstall) applyClusterRoleBinding(ctx context.Context, clusterRoleName string) error {
+	name := fmt.Sprintf("kubectl-operator-%s-cluster-admin", i.ServiceAccount)
+	ac := applyconfigurationsrbacv1.ClusterRoleBinding(name).
+		WithSubjects(applyconfigurationsrbacv1.Subject().WithNamespace(i.Namespace.Name).WithKind("ServiceAccount").WithName(i.ServiceAccount)).
+		WithRoleRef(applyconfigurationsrbacv1.RoleRef().WithKind("ClusterRole").WithName(clusterRoleName))
+	return patchObject(ctx, i.config.Client, ac)
+}
+
+func (i *OperatorInstall) applyClusterExtension(ctx context.Context) error {
+	catalogSource := map[string]interface{}{
+		"packageName": i.Package,
+	}
+	if i.Version != "" {
+		catalogSource["version"] = i.Version
+	}
+	if i.Channels != nil {
+		catalogSource["channels"] = i.Channels
+	}
+	if i.CatalogSelector.MatchLabels != nil || i.CatalogSelector.MatchExpressions != nil {
+		catalogSource["selector"] = i.CatalogSelector
+	}
+	u := unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": ocv1.GroupVersion.String(),
+		"kind":       "ClusterExtension",
+		"metadata": map[string]interface{}{
+			"name": i.Package,
+		},
+		"spec": map[string]interface{}{
+			"namespace": i.Namespace.Name,
+			"serviceAccount": map[string]interface{}{
+				"name": i.ServiceAccount,
+			},
+			"source": map[string]interface{}{
+				"sourceType": "Catalog",
+				"catalog":    catalogSource,
 			},
 		},
+	}}
+	return patchObject(ctx, i.config.Client, &u)
+}
+
+func (i *OperatorInstall) Run(ctx context.Context) (*ocv1.ClusterExtension, error) {
+	if err := i.applyNamespace(ctx); err != nil {
+		return nil, fmt.Errorf("apply namespace %q: %v", i.Namespace.Name, err)
 	}
-	if err := i.config.Client.Create(ctx, op); err != nil {
-		return nil, err
+	if err := i.applyServiceAccount(ctx); err != nil {
+		return nil, fmt.Errorf("apply service account %q: %v", i.ServiceAccount, err)
 	}
 
-	// TODO(developer): Improve the logic in this poll wait once the Operator reconciler
-	//     and conditions types and reasons are improved. For now, this will stop waiting as
-	//     soon as a Ready condition is found, but we should probably wait until the Operator
-	//     stops progressing.
-	// All Types will exist, so Ready may have a false Status. So, wait until
-	// Type=Ready,Status=True happens
+	if i.UnsafeCreateClusterRoleBinding {
+		if err := i.applyClusterRoleBinding(ctx, "cluster-admin"); err != nil {
+			return nil, fmt.Errorf("apply cluster role binding: %v", err)
+		}
+	}
 
-	if err := wait.PollUntilContextCancel(ctx, pollInterval, true, func(conditionCtx context.Context) (bool, error) {
-		if err := i.config.Client.Get(conditionCtx, opKey, op); err != nil {
+	if err := i.applyClusterExtension(ctx); err != nil {
+		return nil, fmt.Errorf("apply cluster extension: %v", err)
+	}
+
+	clusterExtension, err := i.waitForClusterExtensionInstalled(ctx)
+	if err != nil {
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), i.CleanupTimeout)
+		defer cancelCleanup()
+		cleanupErr := i.cleanup(cleanupCtx)
+		return nil, errors.Join(err, cleanupErr)
+	}
+	return clusterExtension, nil
+}
+
+func (i *OperatorInstall) waitForClusterExtensionInstalled(ctx context.Context) (*ocv1.ClusterExtension, error) {
+	clusterExtension := &ocv1.ClusterExtension{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: i.Package,
+		},
+	}
+	errMsg := ""
+	key := client.ObjectKeyFromObject(clusterExtension)
+	if err := wait.PollUntilContextCancel(ctx, time.Millisecond*250, true, func(conditionCtx context.Context) (bool, error) {
+		if err := i.config.Client.Get(conditionCtx, key, clusterExtension); err != nil {
 			return false, err
 		}
-		installedCondition := meta.FindStatusCondition(op.Status.Conditions, olmv1.TypeInstalled)
-		if installedCondition != nil && installedCondition.Status == metav1.ConditionTrue {
-			return true, nil
+		progressingCondition := meta.FindStatusCondition(clusterExtension.Status.Conditions, ocv1.TypeProgressing)
+		if progressingCondition != nil && progressingCondition.Reason != ocv1.ReasonSucceeded {
+			errMsg = progressingCondition.Message
+			return false, nil
 		}
-		return false, nil
+		if !meta.IsStatusConditionPresentAndEqual(clusterExtension.Status.Conditions, ocv1.TypeInstalled, metav1.ConditionTrue) {
+			return false, nil
+		}
+		return true, nil
 	}); err != nil {
-		return nil, fmt.Errorf("waiting for operator to become ready: %v", err)
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		return nil, fmt.Errorf("cluster extension %q did not finish installing: %s", clusterExtension.Name, errMsg)
 	}
+	return clusterExtension, nil
+}
 
-	return op, nil
+func (i *OperatorInstall) cleanup(ctx context.Context) error {
+	clusterExtension := &ocv1.ClusterExtension{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: i.Package,
+		},
+	}
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("kubectl-operator-%s-cluster-admin", i.ServiceAccount),
+		},
+	}
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: i.Namespace.Name,
+			Name:      i.ServiceAccount,
+		},
+	}
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: i.Namespace.Name,
+		},
+	}
+	if err := deleteAndWait(ctx, i.config.Client, clusterExtension); err != nil {
+		return fmt.Errorf("delete clusterextension %q: %v", i.Package, err)
+	}
+	return deleteAndWait(ctx, i.config.Client, clusterRoleBinding, serviceAccount, namespace)
 }

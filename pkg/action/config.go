@@ -3,7 +3,6 @@ package action
 import (
 	"context"
 
-	"github.com/spf13/pflag"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
@@ -13,6 +12,7 @@ import (
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	olmv1 "github.com/operator-framework/operator-controller/api/v1"
 	operatorsv1 "github.com/operator-framework/operator-lifecycle-manager/pkg/package-server/apis/operators/v1"
+	"github.com/spf13/pflag"
 )
 
 func NewScheme() (*runtime.Scheme, error) {
